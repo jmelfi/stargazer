@@ -1,0 +1,18 @@
+# Stargazer Configuration
+
+# GitHub credentials
+github_user: ""
+github_token: ""
+
+# Output settings
+output_file: "README.md"
+output_format: "list"
+
+# Repositories to ignore (optional)
+ignore_repos: []
+
+# Content options
+with_toc: true
+with_stars: true
+with_license: true
+with_back_to_top: false

@@ -1,28 +1,33 @@
+// Package main implements the Stargazer application, which creates lists of starred GitHub repositories.
 package main
 
 import (
 	"bufio"
 	"fmt"
-	"log"
 	"os"
 	"sort"
-	"strconv"
 	"strings"
 	"time"
 
-	"github.com/integrii/flaggy"
+	"github.com/spf13/cobra"
+	"github.com/spf13/viper"
+)
+
+var (
+	rootCmd     *cobra.Command
+	generateCmd *cobra.Command
 )
 
 const (
 	appName = "stargazer"
-	appDesc = ""
+	appDesc = "Creates awesome lists of your starred GitHub repositories"
 
 	defaultOutput      = "README.md"
 	defaultFormat      = "list"
 	defaultWithToc     = true
 	defaultWithStars   = true
 	defaultWithLicense = true
-  defaultWithBtt     = false
+	defaultWithBtt     = false
 
 	envUser   = "GITHUB_USER"
 	envToken  = "GITHUB_TOKEN"
@@ -42,105 +47,111 @@ var (
 	env     map[string]string
 )
 
+// main is the entry point of the Stargazer application.
 func main() {
 	if version == "" {
 		version = "dev"
 	}
-	flaggy.SetName(appName)
-	flaggy.SetDescription(appDesc)
-	flaggy.SetVersion(version)
 
-	var user, token, output, format string
-	var test, wToc, wStars, wLicense, wBtt bool
-	wToc, wStars, wLicense = true, true, true
-	flaggy.String(&output, "o", "output-file", "the file to create (default:"+defaultOutput+" )")
-	flaggy.String(
-		&format,
-		"f",
-		"output-format",
-		"the format of the output ["+strings.Join(availableFormats, ", ")+"] (default:"+defaultFormat+" )",
-	)
-	flaggy.String(&user, "u", "github-user", "github user name")
-	flaggy.String(&token, "", "github-token", "github access token")
-	flaggy.StringSlice(&ignored, "i", "ignore", "repositories to ignore (flag can be specified multiple times)")
-	flaggy.Bool(&test, "t", "test", "just put out some test data")
-	flaggy.Bool(&wToc, "", "with-toc", "print table of contents")
-	flaggy.Bool(&wStars, "", "with-stars", "print starcount of repositories")
-	flaggy.Bool(&wLicense, "", "with-license", "print license of repositories")
-	flaggy.Bool(&wBtt, "", "with-back-to-top", "generate 'back to top' links for each language")
+	initConfig()
 
-	flaggy.Parse()
+	if err := rootCmd.Execute(); err != nil {
+		logger.WithError(err).Fatal("Failed to execute root command")
+	}
+}
 
-	if exists(".env") {
-		env = parseEnvFile(".env")
-	}
+func initConfig() {
+	viper.SetConfigName("stargazer")
+	viper.SetConfigType("yaml")
+	viper.AddConfigPath(".")
+	viper.AutomaticEnv()
 
-	// flag > .env > environment
-	if output == "" {
-		output = getEnv(envOutput, defaultOutput)
+	if err := viper.ReadInConfig(); err == nil {
+		logger.Info("Using config file:", viper.ConfigFileUsed())
 	}
-	if format == "" {
-		format = getEnv(envFormat, defaultFormat)
-	}
-	if user == "" {
-		user = getEnv(envUser, "")
-	}
-	if token == "" {
-		token = getEnv(envToken, "")
-	}
-	if len(ignored) == 0 {
-		ig := getEnv(envIgnore, "")
-		sp := strings.Split(ig, ",")
-		ignored = make([]string, 0)
-		for _, s := range sp {
-			s := strings.Trim(s, " ")
-			if s != "" {
-				ignored = append(ignored, s)
-			}
-		}
+}
+
+// parseConfig processes command-line flags and config file to build the application configuration.
+func init() {
+	rootCmd = &cobra.Command{
+		Use:   appName,
+		Short: appDesc,
+		Long:  appDesc,
+		Run: func(cmd *cobra.Command, args []string) {
+			cmd.Help()
+		},
 	}
 
-	if wToc == defaultWithToc {
-		v := getEnv(envToc, fmt.Sprintf("%t", defaultWithToc))
-		if b, err := strconv.ParseBool(v); err == nil {
-			wToc = b
-		}
-	}
-	if wStars == defaultWithStars {
-		v := getEnv(envStars, fmt.Sprintf("%t", defaultWithStars))
-		if b, err := strconv.ParseBool(v); err == nil {
-			wStars = b
-		}
-	}
-	if wLicense == defaultWithLicense {
-		v := getEnv(envLicense, fmt.Sprintf("%t", defaultWithLicense))
-		if b, err := strconv.ParseBool(v); err == nil {
-			wLicense = b
-		}
-	}
-  if wBtt == defaultWithBtt {
-    v := getEnv(envBttLink, fmt.Sprintf("%t", defaultWithBtt))
-    if b, err := strconv.ParseBool(v); err == nil {
-      wBtt = b
-    }
-  }
-
-	if token == "" && !test {
-		log.Fatal("github token is required")
+	generateCmd = &cobra.Command{
+		Use:   "generate",
+		Short: "Generate the starred repositories list",
+		Run:   runGenerate,
 	}
 
-	if err := initTemplate(format); err != nil {
-		log.Fatal(err)
+	rootCmd.AddCommand(generateCmd)
+
+	generateCmd.Flags().StringP("output-file", "o", defaultOutput, "the file to create")
+	generateCmd.Flags().StringP("output-format", "f", defaultFormat, "the format of the output ["+strings.Join(availableFormats, ", ")+"]")
+	generateCmd.Flags().StringP("github-user", "u", "", "github user name")
+	generateCmd.Flags().String("github-token", "", "github access token")
+	generateCmd.Flags().Int("rate-limit", 5, "number of API requests per second")
+	generateCmd.Flags().StringSliceP("ignore", "i", []string{}, "repositories to ignore (flag can be specified multiple times)")
+	generateCmd.Flags().BoolP("test", "t", false, "just put out some test data")
+	generateCmd.Flags().Bool("with-toc", true, "print table of contents")
+	generateCmd.Flags().Bool("with-stars", true, "print starcount of repositories")
+	generateCmd.Flags().Bool("with-license", true, "print license of repositories")
+	generateCmd.Flags().Bool("with-back-to-top", false, "generate 'back to top' links for each language")
+
+	viper.BindPFlags(generateCmd.Flags())
+}
+
+func runGenerate(cmd *cobra.Command, args []string) {
+	config := &Config{
+		OutputFile:    viper.GetString("output-file"),
+		OutputFormat:  viper.GetString("output-format"),
+		GithubUser:    viper.GetString("github-user"),
+		GithubToken:   viper.GetString("github-token"),
+		IgnoreRepos:   viper.GetStringSlice("ignore"),
+		Test:          viper.GetBool("test"),
+		WithTOC:       viper.GetBool("with-toc"),
+		WithStars:     viper.GetBool("with-stars"),
+		WithLicense:   viper.GetBool("with-license"),
+		WithBackToTop: viper.GetBool("with-back-to-top"),
+		RateLimit:     viper.GetInt("rate-limit"),
 	}
 
+	if config.GithubToken == "" && !config.Test {
+		logger.Fatal("GitHub token is required. Please provide a valid token.")
+	}
+
+	if err := initTemplate(config.OutputFormat); err != nil {
+		logger.WithError(err).Fatal("Failed to initialize template")
+	}
+
+	stars, total, err := fetchAndProcessStars(config)
+	if err != nil {
+		logger.WithError(err).Fatal("Failed to fetch and process stars")
+	}
+
+	err = writeList(config.OutputFile, stars, total, config.WithTOC, config.WithLicense, config.WithStars, config.WithBackToTop)
+	if err != nil {
+		logger.WithError(err).Fatal("Failed to write list")
+	}
+
+	logger.WithField("total_repositories", total).Info("Successfully generated starred repositories list")
+}
+
+// fetchAndProcessStars retrieves and processes starred repositories based on the provided configuration.
+func fetchAndProcessStars(config *Config) (map[string][]Star, int, error) {
 	var stars map[string][]Star
 	var total int
 	var err error
-	if test {
+
+	if config.Test {
 		stars, total = testStars()
 	} else {
-		if stars, total, err = fetchStars(user, token); err != nil {
-			log.Fatal(err)
+		if stars, total, err = DefaultFetchStars(config.GithubUser, config.GithubToken, config.RateLimit); err != nil {
+			return nil, 0, fmt.Errorf("failed to fetch stars: %v", err)
 		}
 	}
 
@@ -151,12 +162,10 @@ func main() {
 		stars[k] = v
 	}
 
-	err = writeList(output, stars, total, wToc, wLicense, wStars, wBtt)
-	if err != nil {
-		log.Fatal(err)
-	}
+	return stars, total, nil
 }
 
+// isIgnored checks if a repository name is in the ignored list.
 func isIgnored(name string) bool {
 	if len(ignored) == 0 {
 		return false
@@ -169,13 +178,14 @@ func isIgnored(name string) bool {
 	return false
 }
 
+// testStars generates test data for starred repositories.
 func testStars() (stars map[string][]Star, total int) {
 	stars = make(map[string][]Star)
 	stars["go"] = make([]Star, 1)
 	s := Star{
-		Url:           "https://github.com/rverst/stargazer",
+		Url:           "https://github.com/jmelfi/stargazer",
 		Name:          "stargazer",
-		NameWithOwner: "rverst/stargazer",
+		NameWithOwner: "jmelfi/stargazer",
 		Description:   "Creates awesome lists of your starred repositories",
 		License:       "MIT License",
 		Stars:         1,
@@ -187,9 +197,9 @@ func testStars() (stars map[string][]Star, total int) {
 	}
 	stars["markdown"] = make([]Star, 1)
 	s = Star{
-		Url:           "https://github.com/rverst/stars",
+		Url:           "https://github.com/jmelfi/stars",
 		Name:          "stars",
-		NameWithOwner: "rverst/stars",
+		NameWithOwner: "jmelfi/stars",
 		Description:   "A list of awesome repositories I starred",
 		License:       "MIT License",
 		Stars:         1,
@@ -204,16 +214,16 @@ func testStars() (stars map[string][]Star, total int) {
 	stars["C++"] = make([]Star, 0)
 
 	stars["C#"] = append(stars["C#"], Star{
-		Url:           "https://github.com/rverst/test",
+		Url:           "https://github.com/jmelfi/test",
 		Name:          "test",
-		NameWithOwner: "rverst/test",
+		NameWithOwner: "jmelfi/test",
 		Description:   "",
 		License:       "MIT License",
 		Stars:         1,
 		StarredAt:     time.Now(),
 	})
 	stars["C++"] = append(stars["C++"], Star{
-		Url:           "https://github.com/rverst/test_2",
+		Url:           "https://github.com/jmelfi/test_2",
 		Name:          "test_2",
 		NameWithOwner: "rverst/test_2",
 		Description:   "Some description",
@@ -223,9 +233,9 @@ func testStars() (stars map[string][]Star, total int) {
 	})
 
 	stars["C#"] = append(stars["C#"], Star{
-		Url:           "https://github.com/rverst/test_3",
+		Url:           "https://github.com/jmelfi/test_3",
 		Name:          "test_3",
-		NameWithOwner: "rverst/test_3",
+		NameWithOwner: "jmelfi/test_3",
 		Description:   "",
 		License:       "",
 		Stars:         1,
@@ -236,7 +246,7 @@ func testStars() (stars map[string][]Star, total int) {
 	return
 }
 
-// .env > environment
+// getEnv retrieves environment variables with fallback to .env file and default values.
 func getEnv(key, defVal string) string {
 	val := os.Getenv(key)
 	if v, ok := env[key]; ok {
@@ -248,26 +258,27 @@ func getEnv(key, defVal string) string {
 	return val
 }
 
+// parseEnvFile reads and parses a .env file.
 func parseEnvFile(file string) map[string]string {
 	env := make(map[string]string)
 	f, err := os.Open(file)
 	if err != nil {
+		logger.WithError(err).Warn("Could not open .env file")
 		return env
 	}
+	defer f.Close()
+
 	s := bufio.NewScanner(f)
 	for s.Scan() {
 		if s.Err() != nil {
+			logger.WithError(s.Err()).Warn("Error scanning .env file")
 			continue
 		}
 		l := strings.Trim(s.Text(), " ")
-		if l == "" {
+		if l == "" || strings.HasPrefix(l, "#") {
 			continue
 		}
-		if strings.HasPrefix(l, "#") {
-			continue
-		}
-		s := strings.Split(l, "=")
-
+		s := strings.SplitN(l, "=", 2)
 		if len(s) == 2 {
 			env[strings.TrimRight(s[0], " ")] = strings.TrimLeft(s[1], " ")
 		}
@@ -275,6 +286,7 @@ func parseEnvFile(file string) map[string]string {
 	return env
 }
 
+// exists checks if a file exists and is not a directory.
 func exists(file string) bool {
 	fi, err := os.Stat(file)
 	if os.IsNotExist(err) {

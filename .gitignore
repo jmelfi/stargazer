@@ -3,6 +3,7 @@
 
 ### Go ###
 # Binaries for programs and plugins
+*.bin
 *.exe
 *.exe~
 *.dll
@@ -127,3 +128,6 @@ list.md
 list.html
 table.md
 table.html
+
+#ignore additional directories
+chat/

@@ -2,26 +2,42 @@ package main
 
 import (
 	"context"
+	"encoding/json"
+	"os"
 	"strings"
 	"time"
 
 	"github.com/shurcooL/githubv4"
+	"github.com/sirupsen/logrus"
 	"golang.org/x/oauth2"
+	"golang.org/x/time/rate"
 )
 
+type RateLimitInfo struct {
+	Limit     int       `json:"limit"`
+	Remaining int       `json:"remaining"`
+	ResetAt   time.Time `json:"reset_at"`
+}
+
+// Star represents a starred GitHub repository with its details.
 type Star struct {
-	Url           string
-	Name          string
-	NameWithOwner string
-	Description   string
-	License       string
-	LicenseUrl    string
-	Stars         int
-	Archived      bool
-	StarredAt     time.Time
+	Url           string    // Repository URL
+	Name          string    // Repository name
+	NameWithOwner string    // Repository name with owner (e.g., "owner/repo")
+	Description   string    // Repository description
+	License       string    // Repository license
+	LicenseUrl    string    // URL to the license
+	Stars         int       // Number of stars
+	Archived      bool      // Whether the repository is archived
+	StarredAt     time.Time // When the repository was starred by the user
 }
 
 var query struct {
+	RateLimit struct {
+		Limit     int
+		Remaining int
+		ResetAt   time.Time
+	}
 	User struct {
 		StarredRepositories struct {
 			IsOverLimit bool
@@ -58,7 +74,11 @@ var query struct {
 	} `graphql:"user(login: $login)"`
 }
 
-func fetchStars(user string, token string) (stars map[string][]Star, total int, err error) {
+// FetchStarsFunc is the function type for fetching stars
+type FetchStarsFunc func(user string, token string, rateLimit int) (map[string][]Star, int, error)
+
+// DefaultFetchStars is the default implementation of FetchStarsFunc
+var DefaultFetchStars FetchStarsFunc = func(user string, token string, rateLimit int) (map[string][]Star, int, error) {
 	ctx, cancel := context.WithTimeout(context.Background(), time.Minute*3)
 	defer cancel()
 
@@ -74,41 +94,64 @@ func fetchStars(user string, token string) (stars map[string][]Star, total int, 
 		"cursor": githubv4.String(""),
 	}
 
-	stars = make(map[string][]Star)
-	total = 0
+	stars := make(map[string][]Star)
+	total := 0
+
+	rateLimiter := rate.NewLimiter(rate.Every(time.Second/time.Duration(rateLimit)), 1)
+
+	rateLimitInfo, err := loadRateLimitInfo()
+	if err != nil {
+		logger.WithError(err).Warn("Failed to load rate limit info, using default")
+	} else {
+		logger.WithFields(logrus.Fields{
+			"remaining": rateLimitInfo.Remaining,
+			"reset_at":  rateLimitInfo.ResetAt,
+		}).Debug("Loaded GitHub API rate limit info")
+	}
+
 	for {
-		err = client.Query(ctx, &query, vars)
-		if err != nil {
-			return
+		if err := rateLimiter.Wait(ctx); err != nil {
+			logger.WithError(err).Error("Rate limit exceeded")
+			return stars, total, err
 		}
 
-		for _, e := range query.User.StarredRepositories.Edges {
-			// skip private repos
-			if e.Node.IsPrivate {
+		err = client.Query(ctx, &query, vars)
+		if err != nil {
+			if isRateLimitError(err) {
+				logger.WithError(err).Warn("Rate limit reached, waiting before retry")
+				time.Sleep(time.Until(query.RateLimit.ResetAt))
 				continue
 			}
-			if isIgnored(e.Node.NameWithOwner) {
+			logger.WithError(err).Error("Failed to query GitHub API")
+			return stars, total, err
+		}
+
+		rateLimitInfo = RateLimitInfo{
+			Limit:     query.RateLimit.Limit,
+			Remaining: query.RateLimit.Remaining,
+			ResetAt:   query.RateLimit.ResetAt,
+		}
+		if err := saveRateLimitInfo(rateLimitInfo); err != nil {
+			logger.WithError(err).Warn("Failed to save rate limit info")
+		}
+
+		logger.WithFields(logrus.Fields{
+			"remaining": rateLimitInfo.Remaining,
+			"reset_at":  rateLimitInfo.ResetAt,
+		}).Debug("GitHub API rate limit status")
+
+		for _, e := range query.User.StarredRepositories.Edges {
+			if e.Node.IsPrivate || isIgnored(e.Node.NameWithOwner) {
 				continue
 			}
 
 			total++
-			lng := "Unknown"
-			if len(e.Node.Languages.Edges) > 0 {
-				lng = e.Node.Languages.Edges[0].Node.Name
-			}
+			lng := determineLanguage(e.Node.Languages.Edges)
 			if _, ok := stars[lng]; !ok {
 				stars[lng] = make([]Star, 0)
 			}
 
-			var lic string
-			if e.Node.LicenseInfo.Nickname != "" {
-				lic = e.Node.LicenseInfo.Nickname
-			} else {
-				lic = e.Node.LicenseInfo.Name
-			}
-			if strings.ToLower(lic) == "other" {
-				lic = ""
-			}
+			lic := determineLicense(e.Node.LicenseInfo)
 
 			stars[lng] = append(stars[lng], Star{
 				Url:           e.Node.Url,
@@ -129,5 +172,64 @@ func fetchStars(user string, token string) (stars map[string][]Star, total int, 
 		vars["cursor"] = githubv4.String(query.User.StarredRepositories.PageInfo.EndCursor)
 	}
 
-	return
+	logger.WithField("total_stars", total).Info("Successfully fetched starred repositories")
+	return stars, total, nil
+}
+
+func loadRateLimitInfo() (RateLimitInfo, error) {
+	data, err := os.ReadFile("rate_limit_info.json")
+	if err != nil {
+		return RateLimitInfo{}, err
+	}
+
+	var info RateLimitInfo
+	if err := json.Unmarshal(data, &info); err != nil {
+		return RateLimitInfo{}, err
+	}
+
+	return info, nil
+}
+
+func saveRateLimitInfo(info RateLimitInfo) error {
+	data, err := json.Marshal(info)
+	if err != nil {
+		return err
+	}
+
+	return os.WriteFile("rate_limit_info.json", data, 0644)
+}
+
+func isRateLimitError(err error) bool {
+	return strings.Contains(err.Error(), "API rate limit exceeded")
+}
+
+func determineLanguage(languages []struct{ Node struct{ Name string } }) string {
+	if len(languages) > 0 {
+		lang := languages[0].Node.Name
+		logger.WithField("language", lang).Debug("Determined repository language")
+		return lang
+	}
+	logger.Debug("No language determined for repository")
+	return "Unknown"
+}
+
+func determineLicense(licenseInfo struct {
+	Name     string
+	Nickname string
+	Url      string
+}) string {
+	var license string
+	if licenseInfo.Nickname != "" {
+		license = licenseInfo.Nickname
+	} else if licenseInfo.Name != "" && strings.ToLower(licenseInfo.Name) != "other" {
+		license = licenseInfo.Name
+	}
+
+	if license != "" {
+		logger.WithField("license", license).Debug("Determined repository license")
+	} else {
+		logger.Debug("No license determined for repository")
+	}
+
+	return license
 }
