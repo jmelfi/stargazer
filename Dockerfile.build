@@ -1,8 +1,8 @@
-FROM golang:1.17 AS builder
+FROM golang:1.22 AS builder
 
 ARG VERSION=unknown
 
-WORKDIR $GOPATH/src/github.com/rverst/stargazer
+WORKDIR $GOPATH/src/github.com/jmelfi/stargazer
 
 ENV CGO_ENABLED 0
 ENV GOOS=linux
